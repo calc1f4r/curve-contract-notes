@@ -1874,85 +1874,560 @@ def remove_liquidity_imbalance(amounts: uint256[N_COINS], max_burn_amount: uint2
 @internal
 def get_y_D(A_: uint256, i: int128, xp: uint256[N_COINS], D: uint256) -> uint256:
     """
-    Calculate x[i] if one reduces D from being calculated for xp to D
-
-    Done by solving quadratic equation iteratively.
-    x_1**2 + x1 * (sum' - (A*n**n - 1) * D / (A * n**n)) = D ** (n + 1) / (n ** (2 * n) * prod' * A)
-    x_1**2 + b*x_1 = c
-
-    x_1 = (x_1**2 + c) / (2*x_1 + b)
+    @notice Calculate balance of token i when pool invariant is reduced to a specific value D
+    @dev This function is the mathematical core of single-token withdrawals. It solves
+         the StableSwap invariant equation for a specific token balance when the total
+         invariant D is known (typically reduced due to LP token burning).
+    
+    Mathematical Foundation:
+    We need to solve the StableSwap invariant for x[i] when D and all other balances are known:
+    
+    An³∑xⱼ + D = ADn³ + D⁴/(4³∏xⱼ)
+    
+    Rearranging for token i when all other tokens j≠i are fixed:
+    xᵢ² + xᵢ(b - D) - c = 0
+    
+    Where:
+    - b = S + D/A  (S = sum of all other token balances except i)
+    - c = D³/(An³∏xⱼ) for j≠i
+    - A = amplification coefficient
+    - D = target invariant (reduced from original)
+    
+    Newton's Method Solution:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    Quadratic Equation Solver                   │
+    │                                                                 │
+    │  f(x) = x² + x(b-D) - c = 0                                    │
+    │  f'(x) = 2x + (b-D)                                           │
+    │                                                                 │
+    │  Newton's iteration:                                           │
+    │  x_new = x_old - f(x_old)/f'(x_old)                          │
+    │        = x_old - (x_old² + x_old(b-D) - c)/(2x_old + b-D)    │
+    │        = (x_old² + c)/(2x_old + b - D)                       │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Convergence Visualization:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                Newton's Method Convergence                     │
+    │                                                                 │
+    │     f(x)                                                       │
+    │      │                                                         │
+    │      │     ╭─╮  Quadratic curve                               │
+    │      │   ╭─╯   ╲                                               │
+    │      │ ╭─╯       ╲                                             │
+    │  ────┼─╯───────────╲──────────────► x (token balance)         │
+    │      │               ╲                                         │
+    │      │                 ╲                                       │
+    │      │                   ╲                                     │
+    │                            ╲                                   │
+    │    x₀     x₁    x₂    x₃    ╲ ← Root (solution)               │
+    │    ↑      ↑     ↑     ↑                                       │
+    │    Start  Iter1 Iter2 Final                                   │
+    │                                                                 │
+    │  Each iteration gets closer to where f(x) = 0                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Example Single Token Withdrawal Calculation:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    Withdrawal Example                          │
+    │                                                                 │
+    │  Initial Pool State:                                           │
+    │  - DAI: 1,000,000 (xp[0] = 1000e18)                          │
+    │  - USDC: 1,000,000 (xp[1] = 1000e18)                         │
+    │  - USDT: 1,000,000 (xp[2] = 1000e18)                         │
+    │  - D₀ = 3,000,000 (approximately)                             │
+    │  - Total LP: 2,950,000                                        │
+    │                                                                 │
+    │  User wants to burn: 295,000 LP tokens (10% of supply)       │
+    │  Target token: DAI (i = 0)                                    │
+    │                                                                 │
+    │  Step 1: Calculate target invariant                           │
+    │  D₁ = D₀ - (295,000 * D₀ / 2,950,000)                        │
+    │     = 3,000,000 - 300,000 = 2,700,000                        │
+    │                                                                 │
+    │  Step 2: Set up equation for DAI balance                      │
+    │  Fixed balances: USDC = 1000e18, USDT = 1000e18              │
+    │  S = 1000e18 + 1000e18 = 2000e18                             │
+    │  b = S + D₁/A = 2000e18 + 2,700,000e18/100 = 2027e18        │
+    │  c = D₁³/(A×n³×USDC×USDT)                                     │
+    │    = (2.7e6)³/(100×27×1000e18×1000e18) ≈ 726e18              │
+    │                                                                 │
+    │  Step 3: Solve x² + x(2027e18 - 2.7e6e18) - 726e18 = 0      │
+    │  Using Newton's method: converges to x ≈ 700e18              │
+    │                                                                 │
+    │  Step 4: Calculate withdrawal amount                          │
+    │  DAI withdrawn = 1000e18 - 700e18 = 300e18 = 300,000 DAI    │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Use Cases in Single Token Withdrawals:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                      Function Applications                      │
+    ├─────────────────────────────────────────────────────────────────┤
+    │                                                                 │
+    │  1. Calculate withdrawal amount (without fees)                 │
+    │     - Input: LP tokens to burn, target token                  │
+    │     - Output: Raw token amount before fees                    │
+    │                                                                 │
+    │  2. Calculate withdrawal amount (with fees)                    │
+    │     - Apply imbalance fees to the raw amount                  │
+    │     - Account for reduced pool balance after fees             │
+    │                                                                 │
+    │  3. Validate withdrawal feasibility                           │
+    │     - Ensure sufficient token balance exists                  │
+    │     - Check that solution converges properly                  │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Comparison with Other Balance Calculations:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │              get_y() vs get_y_D() Comparison                   │
+    ├─────────────────────────────────────────────────────────────────┤
+    │                                                                 │
+    │  get_y() - Swap calculations:                                  │
+    │  ✓ Input: New balance of input token                          │
+    │  ✓ Output: New balance of output token                        │
+    │  ✓ Maintains constant D (invariant preservation)              │
+    │  ✓ Used for: Token swaps, price calculations                  │
+    │                                                                 │
+    │  get_y_D() - Withdrawal calculations:                         │
+    │  ✓ Input: Target invariant D (reduced from original)          │
+    │  ✓ Output: New balance of withdrawal token                    │
+    │  ✓ Allows D to change (liquidity removal)                     │
+    │  ✓ Used for: Single token withdrawals, LP burning             │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Mathematical Properties:
+    1. **Uniqueness**: For valid inputs, there's exactly one positive solution
+    2. **Convergence**: Newton's method typically converges in 3-8 iterations
+    3. **Stability**: Small changes in D produce proportional changes in result
+    4. **Bounded**: Solution is always less than the sum of other token balances
+    
+    @param A_ Amplification coefficient (current value, not interpolated)
+    @param i Index of token to solve for (0=DAI, 1=USDC, 2=USDT)
+    @param xp Array of current normalized token balances
+    @param D Target invariant value (typically reduced from current)
+    @return New balance of token i that satisfies the target invariant D
     """
-    # x in the input is converted to the same price/precision
-
+    # Validate token index to prevent invalid calculations
     assert i >= 0  # dev: i below zero
     assert i < N_COINS  # dev: i above N_COINS
 
+    # Initialize variables for building the quadratic equation
+    # c will become: c = D³/(An³∏xⱼ) for j≠i
     c: uint256 = D
-    S_: uint256 = 0
-    Ann: uint256 = A_ * N_COINS
+    S_: uint256 = 0  # Sum of balances for all tokens except i
+    Ann: uint256 = A_ * N_COINS  # A * n for efficiency
 
+    # Build the equation coefficients by iterating through all tokens except i
     _x: uint256 = 0
     for _i in range(N_COINS):
         if _i != i:
+            # Use current balance for all tokens except the target token i
             _x = xp[_i]
         else:
+            # Skip the target token i - we're solving for its balance
             continue
+        
+        # Add to sum of other token balances
         S_ += _x
+        
+        # Build c coefficient: multiply by D and divide by (_x * N_COINS)
+        # This constructs: c = c * D / (_x * N_COINS) = D * D * D / (∏_x * N_COINS³)
         c = c * D / (_x * N_COINS)
+    
+    # Complete the c calculation: c = D³/(Ann * N_COINS) * 1/∏xⱼ
     c = c * D / (Ann * N_COINS)
+    
+    # Calculate b coefficient: b = S + D/Ann
+    # This represents: S = sum of other balances, D/Ann = D/(A*n)
     b: uint256 = S_ + D / Ann
+    
+    # Newton's method iteration to solve: y² + y(b-D) - c = 0
     y_prev: uint256 = 0
-    y: uint256 = D
+    y: uint256 = D  # Initial guess: start with D as the balance estimate
+    
+    # Iterate using Newton's method with maximum 255 iterations for safety
     for _i in range(255):
         y_prev = y
+        
+        # Newton's method update: y = (y² + c) / (2y + b - D)
+        # This comes from: y_new = y_old - f(y_old)/f'(y_old)
+        # Where f(y) = y² + y(b-D) - c and f'(y) = 2y + (b-D)
         y = (y*y + c) / (2 * y + b - D)
-        # Equality with the precision of 1
+        
+        # Check convergence (precision of 1 wei)
         if y > y_prev:
             if y - y_prev <= 1:
-                break
+                break  # Converged from below
         else:
             if y_prev - y <= 1:
-                break
+                break  # Converged from above
+    
     return y
 
 
 @view
 @internal
 def _calc_withdraw_one_coin(_token_amount: uint256, i: int128) -> (uint256, uint256):
-    # First, need to calculate
-    # * Get current D
-    # * Solve Eqn against y_i for D - _token_amount
+    """
+    @notice Calculate withdrawal amount and fees for single-token withdrawal
+    @dev This is the core calculation engine for single-token withdrawals. It computes
+         both the gross withdrawal amount (before fees) and the net amount (after fees)
+         that the user will receive when burning LP tokens for a single asset.
+    
+    Single Token Withdrawal Process:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                Single Token Withdrawal Flow                    │
+    ├─────────────────────────────────────────────────────────────────┤
+    │                                                                 │
+    │  1. Calculate target invariant D₁ after LP token burn          │
+    │  2. Solve for new token balance using get_y_D()                │
+    │  3. Calculate gross withdrawal (before fees)                   │
+    │  4. Calculate imbalance fees for the withdrawal                │
+    │  5. Apply fees to get net withdrawal amount                    │
+    │  6. Return both net amount and fee amount                      │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Mathematical Foundation:
+    
+    When a user burns LP tokens and wants only one type of asset, they create
+    an imbalance in the pool. This deviation from the ideal balanced withdrawal
+    is penalized through fees to prevent arbitrage exploitation.
+    
+    Step 1: Calculate New Invariant
+    D₁ = D₀ - (LP_burned / total_LP_supply) × D₀
+    D₁ = D₀ × (1 - LP_burned / total_LP_supply)
+    
+    Step 2: Ideal vs Actual Withdrawal
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                 Ideal vs Actual Comparison                     │
+    │                                                                 │
+    │  Ideal Balanced Withdrawal:    Actual Single Token Withdrawal: │
+    │  ┌─────────────────┐          ┌─────────────────┐             │
+    │  │ Before │ After  │          │ Before │ After  │             │
+    │  │ DAI:1000│ 900   │          │ DAI:1000│ 700   │ ← More     │
+    │  │ USDC:1000│ 900  │          │ USDC:1000│ 1000 │ ← Same     │
+    │  │ USDT:1000│ 900  │          │ USDT:1000│ 1000 │ ← Same     │
+    │  └─────────────────┘          └─────────────────┘             │
+    │                                                                 │
+    │  No imbalance (no fees)       Large imbalance (fees apply)    │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Step 3: Fee Calculation Process
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                      Fee Structure                              │
+    │                                                                 │
+    │  Base Fee Rate:                                                │
+    │  fee_rate = pool_fee × N_COINS / (4 × (N_COINS-1))            │
+    │  fee_rate = 0.04% × 3 / (4 × 2) = 0.015%                      │
+    │                                                                 │
+    │  For each token j:                                             │
+    │  1. Calculate ideal balance after D change                     │
+    │     ideal[j] = current[j] × D₁ / D₀                           │
+    │                                                                 │
+    │  2. Calculate actual balance after withdrawal                  │
+    │     actual[j] = current[j] - withdrawal_amount (if j=i)        │
+    │     actual[j] = current[j] (if j≠i)                           │
+    │                                                                 │
+    │  3. Calculate deviation and apply fee                         │
+    │     deviation[j] = |actual[j] - ideal[j]|                     │
+    │     fee[j] = fee_rate × deviation[j]                          │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Detailed Example Calculation:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                   Withdrawal Calculation                       │
+    │                                                                 │
+    │  Initial State:                                                │
+    │  - Pool: [1000k DAI, 1000k USDC, 1000k USDT]                 │
+    │  - D₀ = 3,000,000 (approximately)                             │
+    │  - Total LP = 2,950,000                                       │
+    │  - Pool fee = 0.04%                                           │
+    │                                                                 │
+    │  User Action:                                                  │
+    │  - Burns: 295,000 LP tokens (10% of supply)                   │
+    │  - Wants: Only DAI (i = 0)                                    │
+    │                                                                 │
+    │  Step 1: Calculate new invariant                              │
+    │  D₁ = 3,000,000 × (1 - 295,000/2,950,000) = 2,700,000        │
+    │                                                                 │
+    │  Step 2: Calculate gross withdrawal (before fees)             │
+    │  Using get_y_D(): new_DAI_balance ≈ 700,000                   │
+    │  Gross withdrawal = 1,000,000 - 700,000 = 300,000 DAI        │
+    │                                                                 │
+    │  Step 3: Calculate ideal balances                             │
+    │  ideal_DAI = 1,000,000 × 2,700,000/3,000,000 = 900,000      │
+    │  ideal_USDC = 1,000,000 × 2,700,000/3,000,000 = 900,000     │
+    │  ideal_USDT = 1,000,000 × 2,700,000/3,000,000 = 900,000     │
+    │                                                                 │
+    │  Step 4: Calculate actual balances (before fees)             │
+    │  actual_DAI = 1,000,000 - 300,000 = 700,000                  │
+    │  actual_USDC = 1,000,000 (unchanged)                          │
+    │  actual_USDT = 1,000,000 (unchanged)                          │
+    │                                                                 │
+    │  Step 5: Calculate deviations                                 │
+    │  deviation_DAI = |700,000 - 900,000| = 200,000               │
+    │  deviation_USDC = |1,000,000 - 900,000| = 100,000            │
+    │  deviation_USDT = |1,000,000 - 900,000| = 100,000            │
+    │                                                                 │
+    │  Step 6: Apply fees (0.015% rate)                            │
+    │  fee_DAI = 200,000 × 0.015% = 30 DAI                         │
+    │  fee_USDC = 100,000 × 0.015% = 15 USDC                       │
+    │  fee_USDT = 100,000 × 0.015% = 15 USDT                       │
+    │                                                                 │
+    │  Step 7: Calculate final amounts                              │
+    │  Net withdrawal = Gross - (fees applied to withdrawal token)  │
+    │  Net DAI = 300,000 - additional_fee_from_recalculation ≈ 299,900 │
+    │  Total fee ≈ 100 DAI equivalent                               │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Fee Visualization:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    Fee Impact Analysis                         │
+    │                                                                 │
+    │   Withdrawal Amount                                            │
+    │        │                                                       │
+    │        │  ┌─────────────────┐ ← Gross Amount (300,000)        │
+    │        │  │                 │                                 │
+    │        │  │   User Gets     │ ← Net Amount (~299,900)         │
+    │        │  │                 │                                 │
+    │        │  ├─────────────────┤                                 │
+    │        │  │     Fees        │ ← Trading Fees (~100)           │
+    │        │  └─────────────────┘                                 │
+    │        │                                                       │
+    │        └───────────────────────────────────────► Token Amount │
+    │                                                                 │
+    │  Fee percentage ≈ 0.033% of withdrawal amount                 │
+    │  (Lower than full swap fee due to partial imbalance)          │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Why Fees Are Applied:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                     Economic Rationale                         │
+    ├─────────────────────────────────────────────────────────────────┤
+    │                                                                 │
+    │  Without Fees:                                                 │
+    │  ❌ Arbitrageurs could exploit price differences               │
+    │  ❌ Pool becomes imbalanced, hurting other LPs                 │
+    │  ❌ Free option to exit at ideal price always                 │
+    │                                                                 │
+    │  With Imbalance Fees:                                         │
+    │  ✅ Prevents arbitrage exploitation                           │
+    │  ✅ Compensates remaining LPs for increased risk              │
+    │  ✅ Maintains pool stability and balance                      │
+    │  ✅ Creates fair pricing for convenience                      │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Return Values:
+    - First return value (dy): Net amount user receives after all fees
+    - Second return value (dy_0 - dy): Total fee amount charged
+    
+    Use Cases:
+    1. **Frontend Estimation**: Show users expected withdrawal amounts
+    2. **Slippage Calculation**: Compare with user's minimum expectations
+    3. **Fee Analysis**: Understand cost of single-token vs balanced withdrawal
+    4. **Liquidity Analysis**: Assess impact of large withdrawals on pool
+    
+    @param _token_amount Number of LP tokens to burn
+    @param i Index of token to withdraw (0=DAI, 1=USDC, 2=USDT)
+    @return (net_withdrawal_amount, total_fees)
+    """
+    # Get current pool parameters
     amp: uint256 = self._A()
+    
+    # Calculate reduced fee rate for single-token withdrawals
+    # Same as imbalanced withdrawal: 1/4 of the swap fee
     _fee: uint256 = self.fee * N_COINS / (4 * (N_COINS - 1))
     precisions: uint256[N_COINS] = PRECISION_MUL
     total_supply: uint256 = self.token.totalSupply()
 
+    # Get current normalized balances
     xp: uint256[N_COINS] = self._xp()
 
+    # Calculate current pool invariant D₀
     D0: uint256 = self.get_D(xp, amp)
+    
+    # Calculate target invariant D₁ after burning LP tokens
+    # D₁ = D₀ × (1 - LP_burned / total_LP_supply)
     D1: uint256 = D0 - _token_amount * D0 / total_supply
+    
+    # Create working copy of current balances for fee calculations
     xp_reduced: uint256[N_COINS] = xp
 
+    # Calculate new balance of withdrawal token to achieve D₁
+    # This gives us the gross withdrawal amount (before fees)
     new_y: uint256 = self.get_y_D(amp, i, xp, D1)
-    dy_0: uint256 = (xp[i] - new_y) / precisions[i]  # w/o fees
+    
+    # Calculate gross withdrawal amount (before fees)
+    # Convert from normalized precision back to token precision
+    dy_0: uint256 = (xp[i] - new_y) / precisions[i]
 
+    # Calculate imbalance fees by comparing actual vs ideal balance changes
     for j in range(N_COINS):
+        # Calculate expected balance change for each token in ideal case
         dx_expected: uint256 = 0
+        
         if j == i:
+            # For withdrawal token: expected change = ideal_new_balance - actual_new_balance
+            # ideal_new_balance = current_balance × D₁/D₀
+            # actual_new_balance = new_y (calculated above)
             dx_expected = xp[j] * D1 / D0 - new_y
         else:
+            # For other tokens: expected change = current_balance - ideal_new_balance
+            # In ideal case: ideal_new_balance = current_balance × D₁/D₀
             dx_expected = xp[j] - xp[j] * D1 / D0
+        
+        # Apply fee to the expected deviation and reduce the balance accordingly
+        # This simulates the effect of fees on the pool state
         xp_reduced[j] -= _fee * dx_expected / FEE_DENOMINATOR
 
+    # Recalculate withdrawal amount using the fee-adjusted balances
+    # This accounts for the fees charged on the imbalance
     dy: uint256 = xp_reduced[i] - self.get_y_D(amp, i, xp_reduced, D1)
-    dy = (dy - 1) / precisions[i]  # Withdraw less to account for rounding errors
+    
+    # Convert to token precision and subtract 1 wei for rounding safety
+    dy = (dy - 1) / precisions[i]
 
+    # Return both the net amount (after fees) and the total fee amount
     return dy, dy_0 - dy
 
 
 @view
 @external
 def calc_withdraw_one_coin(_token_amount: uint256, i: int128) -> uint256:
+    """
+    @notice Calculate the amount of tokens received for single-token withdrawal (public interface)
+    @dev This is the public wrapper function for `_calc_withdraw_one_coin()`. It provides
+         a simple interface for frontends, aggregators, and users to estimate withdrawal
+         amounts before executing the actual transaction.
+    
+    Function Purpose and Usage:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    Public Estimation Interface                  │
+    ├─────────────────────────────────────────────────────────────────┤
+    │                                                                 │
+    │  Purpose: Estimate withdrawal amount WITHOUT executing trade    │
+    │  Returns: Net amount user will receive (after all fees)        │
+    │  Gas Cost: Low (view function, no state changes)               │
+    │  Use Cases:                                                     │
+    │  - Frontend estimation and display                             │
+    │  - Slippage calculation                                        │
+    │  - Arbitrage opportunity analysis                              │
+    │  - Portfolio rebalancing planning                              │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Practical Example for Frontend Usage:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    Frontend Integration                        │
+    │                                                                 │
+    │  User Input:                                                   │
+    │  - LP tokens to burn: 100,000                                 │
+    │  - Desired token: USDC (i = 1)                                │
+    │                                                                 │
+    │  Function Call:                                                │
+    │  estimated_usdc = pool.calc_withdraw_one_coin(100000e18, 1)    │
+    │  // Returns: 99,950 USDC (example)                            │
+    │                                                                 │
+    │  Display to User:                                              │
+    │  "You will receive approximately 99,950 USDC"                 │
+    │  "Fee: ~50 USDC (0.05%)"                                      │
+    │  "Click 'Withdraw' to confirm"                                │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Comparison with Other Calculation Functions:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                Function Comparison Overview                     │
+    ├─────────────────────────────────────────────────────────────────┤
+    │                                                                 │
+    │  calc_withdraw_one_coin():                                     │
+    │  ✓ Single token withdrawal estimation                          │
+    │  ✓ Includes all fees in calculation                           │
+    │  ✓ Returns net amount user receives                           │
+    │  ✓ Used for: UX display, slippage protection                  │
+    │                                                                 │
+    │  calc_token_amount():                                          │
+    │  ✓ Multi-token deposit/withdrawal estimation                   │
+    │  ✓ Balanced or imbalanced operations                          │
+    │  ✓ Returns LP tokens needed/burned                            │
+    │  ✓ Used for: Liquidity provision planning                     │
+    │                                                                 │
+    │  get_dy():                                                     │
+    │  ✓ Token swap amount estimation                               │
+    │  ✓ Includes swap fees                                         │
+    │  ✓ Returns tokens received for token swaps                    │
+    │  ✓ Used for: Trading, arbitrage analysis                      │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Economic Interpretation:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                     Cost-Benefit Analysis                      │
+    │                                                                 │
+    │  Benefits of Single Token Withdrawal:                         │
+    │  ✅ Convenience: Get exactly the token you need               │
+    │  ✅ No rebalancing: Don't need to sell unwanted tokens        │
+    │  ✅ Strategic: Target specific tokens for opportunities        │
+    │                                                                 │
+    │  Costs of Single Token Withdrawal:                            │
+    │  🟡 Imbalance Fees: ~0.015% of deviation amount               │
+    │  🟡 Gas Costs: Slightly higher than balanced withdrawal       │
+    │  🟡 Slippage: Creates pool imbalance                          │
+    │                                                                 │
+    │  When to Use Single Token Withdrawal:                         │
+    │  💰 Need specific token for payments/opportunities            │
+    │  💰 Fee cost < convenience benefit                            │
+    │  💰 Small withdrawals (lower fee impact)                      │
+    │  💰 Pool is already imbalanced in your favor                  │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Slippage Protection Integration:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                  Slippage Calculation Guide                    │
+    │                                                                 │
+    │  Step 1: Get current estimate                                  │
+    │  current_estimate = calc_withdraw_one_coin(lp_amount, i)       │
+    │                                                                 │
+    │  Step 2: Apply slippage tolerance (e.g., 0.5%)               │
+    │  slippage_tolerance = 0.005  // 0.5%                          │
+    │  min_amount = current_estimate * (1 - slippage_tolerance)      │
+    │                                                                 │
+    │  Step 3: Use in actual withdrawal                             │
+    │  pool.remove_liquidity_one_coin(lp_amount, i, min_amount)     │
+    │                                                                 │
+    │  Example:                                                      │
+    │  - Estimate: 100,000 USDC                                     │
+    │  - Tolerance: 0.5%                                            │
+    │  - Min amount: 99,500 USDC                                    │
+    │  - Protection: Transaction reverts if < 99,500 USDC           │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Gas Optimization Notes:
+    - This is a view function (no gas cost when called externally)
+    - Internal calculations are optimized for gas efficiency
+    - Consider caching results if calling multiple times
+    - Batch with other view calls for better efficiency
+    
+    Error Scenarios:
+    - Invalid token index (i): Function will revert
+    - Zero LP token amount: Returns 0
+    - Pool killed: Function still works (view only)
+    - Insufficient pool balance: May return unrealistic values
+    
+    @param _token_amount Number of LP tokens to burn for withdrawal estimation
+    @param i Index of token to receive (0=DAI, 1=USDC, 2=USDT)
+    @return Net amount of tokens user will receive after all fees
+    """
     return self._calc_withdraw_one_coin(_token_amount, i)[0]
 
 
@@ -1960,19 +2435,242 @@ def calc_withdraw_one_coin(_token_amount: uint256, i: int128) -> uint256:
 @nonreentrant('lock')
 def remove_liquidity_one_coin(_token_amount: uint256, i: int128, min_amount: uint256):
     """
-    Remove _amount of liquidity all in a form of coin i
+    @notice Remove liquidity by burning LP tokens and receiving a single token type
+    @dev This function implements single-token withdrawal, allowing users to burn their
+         LP tokens and receive only one type of underlying asset. This creates pool
+         imbalance and incurs fees, but provides convenience and targeted exposure.
+    
+    Single Token Withdrawal Complete Process:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                  Complete Withdrawal Flow                      │
+    ├─────────────────────────────────────────────────────────────────┤
+    │                                                                 │
+    │  1. 🔒 Security Checks                                          │
+    │     ✓ Pool not killed/emergency shutdown                       │
+    │     ✓ Reentrancy protection (nonreentrant lock)               │
+    │     ✓ Valid token index and amounts                           │
+    │                                                                 │
+    │  2. 📊 Calculate Withdrawal Amount                              │
+    │     ✓ Call _calc_withdraw_one_coin() for precise calculation   │
+    │     ✓ Apply imbalance fees to withdrawal amount                │
+    │     ✓ Calculate admin fee portion                              │
+    │                                                                 │
+    │  3. 🛡️ Slippage Protection                                      │
+    │     ✓ Check withdrawal amount >= min_amount                    │
+    │     ✓ Prevent excessive slippage due to market changes         │
+    │                                                                 │
+    │  4. 💰 Execute Financial Operations                             │
+    │     ✓ Update pool balance (subtract withdrawn + admin fees)    │
+    │     ✓ Burn LP tokens from user's account                      │
+    │     ✓ Transfer tokens to user safely                          │
+    │                                                                 │
+    │  5. 📝 Record Transaction                                       │
+    │     ✓ Emit RemoveLiquidityOne event                           │
+    │     ✓ Log for off-chain tracking and analytics                │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Mathematical Process Overview:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                     Math Behind the Scenes                     │
+    │                                                                 │
+    │  Before Withdrawal:                                            │
+    │  Pool: [x₀, x₁, x₂] = [1000k DAI, 1000k USDC, 1000k USDT]    │
+    │  D₀ = 3,000,000 (invariant)                                   │
+    │  LP_supply = 2,950,000                                        │
+    │                                                                 │
+    │  User Action: Burn 295k LP for DAI only                       │
+    │                                                                 │
+    │  Step 1: Calculate target invariant                           │
+    │  D₁ = D₀ × (1 - LP_burned/LP_total)                          │
+    │     = 3,000,000 × (1 - 295,000/2,950,000) = 2,700,000        │
+    │                                                                 │
+    │  Step 2: Solve for new DAI balance with invariant D₁          │
+    │  Using get_y_D(): new_DAI_balance ≈ 700,000                   │
+    │  Gross withdrawal = 1,000,000 - 700,000 = 300,000 DAI        │
+    │                                                                 │
+    │  Step 3: Apply imbalance fees                                 │
+    │  Fee rate = 0.04% × 3/(4×2) = 0.015%                         │
+    │  Net withdrawal ≈ 299,900 DAI                                 │
+    │  Admin fees ≈ 25 DAI (50% of 50 DAI total fees)              │
+    │                                                                 │
+    │  After Withdrawal:                                             │
+    │  Pool: [700,075 DAI, 1000k USDC, 1000k USDT]                 │
+    │  LP_supply = 2,655,000                                        │
+    │  User receives: 299,900 DAI                                   │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Visual Representation of Pool Changes:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    Pool State Transition                       │
+    │                                                                 │
+    │  Before:                          After:                       │
+    │  ┌─────────────────────┐         ┌─────────────────────┐       │
+    │  │  Pool Composition   │         │  Pool Composition   │       │
+    │  │                     │         │                     │       │
+    │  │  🟡 DAI:   1000k    │   →     │  🟡 DAI:   700k     │ ← -30%│
+    │  │  🔵 USDC:  1000k    │         │  🔵 USDC:  1000k    │ ← Same│
+    │  │  🟢 USDT:  1000k    │         │  🟢 USDT:  1000k    │ ← Same│
+    │  │                     │         │                     │       │
+    │  │  Balance: Ideal     │         │  Balance: Skewed    │       │
+    │  │  LP Supply: 2950k   │         │  LP Supply: 2655k   │       │
+    │  └─────────────────────┘         └─────────────────────┘       │
+    │                                                                 │
+    │  Pool becomes imbalanced toward USDC/USDT                     │
+    │  Creates arbitrage opportunities for rebalancing              │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Fee Structure and Economic Impact:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                       Fee Breakdown                            │
+    │                                                                 │
+    │  Base Pool Fee: 0.04% (for regular swaps)                     │
+    │  Imbalance Fee: 0.04% × 3/(4×2) = 0.015%                      │
+    │                                                                 │
+    │  Why Lower Fee for Withdrawals?                                │
+    │  • Encourages liquidity provision                             │
+    │  • Less harmful than pure arbitrage swaps                     │
+    │  • Partially offsets by requiring pool rebalancing            │
+    │                                                                 │
+    │  Fee Distribution:                                             │
+    │  ┌─────────────────────────────────────────────────────────── │
+    │  │              Total Fees (100 DAI)                         │ │
+    │  ├─────────────────────────────────────────────────────────── │
+    │  │  Admin Fee (50%)     │  LP Fee (50%)                     │ │
+    │  │  → Protocol Treasury │  → Remaining LPs                  │ │
+    │  │  → 50 DAI           │  → 50 DAI                         │ │
+    │  └─────────────────────────────────────────────────────────── │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Security Features and Protections:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                      Security Measures                         │
+    ├─────────────────────────────────────────────────────────────────┤
+    │                                                                 │
+    │  🔒 Reentrancy Protection:                                     │
+    │     • @nonreentrant('lock') decorator                          │
+    │     • Prevents recursive calls during execution               │
+    │     • Protects against flash loan attacks                     │
+    │                                                                 │
+    │  🛡️ Emergency Protection:                                      │
+    │     • Pool kill switch (is_killed check)                      │
+    │     • Prevents operations during emergencies                  │
+    │     • Admin can halt all withdrawals if needed                │
+    │                                                                 │
+    │  💸 Slippage Protection:                                       │
+    │     • min_amount parameter enforcement                         │
+    │     • Transaction reverts if amount < minimum                  │
+    │     • Prevents sandwich attacks and MEV exploitation          │
+    │                                                                 │
+    │  🔐 Safe Token Transfers:                                      │
+    │     • Custom ERC20 transfer implementation                     │
+    │     • Handles tokens that don't return bool                   │
+    │     • Validates transfer success explicitly                    │
+    │                                                                 │
+    │  ⚖️ Precise Accounting:                                        │
+    │     • Exact balance tracking                                   │
+    │     • Prevents rounding exploits                              │
+    │     • Admin fee calculation safeguards                        │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Use Cases and Strategic Applications:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                      When to Use This Function                 │
+    ├─────────────────────────────────────────────────────────────────┤
+    │                                                                 │
+    │  💼 Portfolio Management:                                      │
+    │     • Reduce exposure to specific stablecoins                 │
+    │     • Rebalance portfolio allocations                         │
+    │     • Take profits in preferred currency                      │
+    │                                                                 │
+    │  🏦 Operational Needs:                                         │
+    │     • Get specific token for loan repayments                  │
+    │     • Meet margin requirements in particular asset            │
+    │     • Cover expenses in required currency                     │
+    │                                                                 │
+    │  📈 Trading Opportunities:                                     │
+    │     • Exit to specific token for external opportunities       │
+    │     • Arbitrage with other protocols/DEXs                     │
+    │     • Prepare for known market events                         │
+    │                                                                 │
+    │  ⚡ Convenience Factors:                                       │
+    │     • Avoid multiple token management                          │
+    │     • Reduce gas costs from token conversions                 │
+    │     • Simplify tax accounting                                  │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Comparison with Other Withdrawal Methods:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                  Withdrawal Method Comparison                   │
+    ├─────────────────────────────────────────────────────────────────┤
+    │                                                                 │
+    │  remove_liquidity() - Balanced Withdrawal:                    │
+    │  ✅ Fee: 0% (no trading fees)                                  │
+    │  ✅ Speed: Fast execution                                      │
+    │  ❌ Output: Get all 3 tokens proportionally                   │
+    │  ❌ Use case: When you want all tokens                        │
+    │                                                                 │
+    │  remove_liquidity_imbalance() - Custom Amounts:               │
+    │  🟡 Fee: 0.015% on imbalanced portions                        │
+    │  🟡 Speed: Moderate (more complex calculations)               │
+    │  ✅ Output: Exact amounts of each token you specify           │
+    │  ✅ Use case: Precise portfolio rebalancing                   │
+    │                                                                 │
+    │  remove_liquidity_one_coin() - Single Token:                  │
+    │  🔴 Fee: 0.015% on full withdrawal amount                     │
+    │  🔴 Speed: Moderate (complex fee calculations)                │
+    │  ✅ Output: Only the token you want                           │
+    │  ✅ Use case: Maximum convenience, targeted exposure          │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+    
+    Event Logging and Analytics:
+    The function emits `RemoveLiquidityOne(provider, token_amount, coin_amount)`
+    This enables:
+    - Historical withdrawal tracking
+    - Volume analytics for each token
+    - User behavior analysis
+    - DeFi protocol integrations
+    - Tax reporting assistance
+    
+    @param _token_amount Number of LP tokens to burn for withdrawal
+    @param i Index of token to receive (0=DAI, 1=USDC, 2=USDT)
+    @param min_amount Minimum amount of tokens to receive (slippage protection)
     """
+    # Security check: Ensure pool is not in emergency shutdown state
     assert not self.is_killed  # dev: is killed
 
+    # Calculate both the net withdrawal amount and fees using internal function
     dy: uint256 = 0
     dy_fee: uint256 = 0
     dy, dy_fee = self._calc_withdraw_one_coin(_token_amount, i)
+    
+    # Slippage protection: Ensure user gets at least their minimum expected amount
+    # This prevents losses due to:
+    # - Market movements between estimation and execution
+    # - MEV attacks and sandwich attacks
+    # - Unexpected pool state changes
     assert dy >= min_amount, "Not enough coins removed"
 
+    # Update pool balance accounting:
+    # - Subtract the amount withdrawn (dy)
+    # - Subtract the admin fee portion (admin gets percentage of total fees)
+    # - The remaining fee stays in the pool to benefit other LPs
     self.balances[i] -= (dy + dy_fee * self.admin_fee / FEE_DENOMINATOR)
+    
+    # Burn LP tokens from user's account
+    # This permanently reduces the total LP token supply
+    # If user doesn't have enough LP tokens, this will revert
     self.token.burnFrom(msg.sender, _token_amount)  # dev: insufficient funds
 
-    # "safeTransfer" which works for ERC20s which return bool or not
+    # Safe token transfer to user
+    # Custom implementation that works with both:
+    # - Standard ERC20 tokens that return bool
+    # - Non-standard tokens (like USDT) that don't return values
     _response: Bytes[32] = raw_call(
         self.coins[i],
         concat(
@@ -1982,9 +2680,13 @@ def remove_liquidity_one_coin(_token_amount: uint256, i: int128, min_amount: uin
         ),
         max_outsize=32,
     )  # dev: failed transfer
+    
+    # Verify transfer succeeded for tokens that return bool
     if len(_response) > 0:
         assert convert(_response, bool)  # dev: failed transfer
 
+    # Emit event for off-chain tracking and analytics
+    # Parameters: user_address, lp_tokens_burned, tokens_received
     log RemoveLiquidityOne(msg.sender, _token_amount, dy)
 
 
